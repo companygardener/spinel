@@ -2011,6 +2011,14 @@ class Compiler
     lt = ""
     if recv >= 0
       lt = infer_type(recv)
+      if lt == "poly"
+        if mname == "+" || mname == "-" || mname == "*" || mname == "/" || mname == "%" || mname == "**"
+          return "poly"
+        end
+        if mname == "<<" || mname == ">>" || mname == "&" || mname == "|" || mname == "^" || mname == "-@"
+          return "poly"
+        end
+      end
       # Bigint operators return bigint
       if lt == "bigint"
         if mname == "+" || mname == "-" || mname == "*" || mname == "/" || mname == "%"
@@ -2930,6 +2938,9 @@ class Compiler
         if rt == "mutable_str"
           return "string"
         end
+        if rt == "poly"
+          return "poly"
+        end
         if rt == "int_array"
           # a[range] / a[start, len] returns a slice (still int_array);
           # bare a[i] returns the element.
@@ -2975,6 +2986,19 @@ class Compiler
             end
           end
           return "string"
+        end
+        if rt == "poly_array"
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            a = get_args(args_id)
+            if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
+              return "poly_array"
+            end
+            if a.length >= 2
+              return "poly_array"
+            end
+          end
+          return "poly"
         end
         if is_ptr_array_type(rt) == 1
           return ptr_array_elem_type(rt)
@@ -3247,6 +3271,9 @@ class Compiler
       if rt == "poly"
         if mname == "nil?"
           return "bool"
+        end
+        if mname == "[]"
+          return "poly"
         end
         # Scan every user class that defines this method. If they all
         # agree on the return type, the call has that concrete type.
@@ -5318,9 +5345,14 @@ class Compiler
           types[k] = new_type
           @cls_ivar_types[ci] = types.join(";")
         end
-        return
       end
       k = k + 1
+    end
+    if @cls_parents[ci] != ""
+      pi = find_class_idx(@cls_parents[ci])
+      if pi >= 0
+        replace_ivar_type(pi, iname, new_type)
+      end
     end
   end
 
@@ -5336,6 +5368,13 @@ class Compiler
             types[k] = new_type
             @cls_ivar_types[ci] = types.join(";")
           elsif old != new_type && old != "poly"
+            if is_array_type(old) == 1 && is_array_type(new_type) == 1
+              types[k] = "poly_array"
+              @needs_rb_value = 1
+              @cls_ivar_types[ci] = types.join(";")
+              k = k + 1
+              next
+            end
             # Nullable pattern: nil + T → T?, T + nil → T?
             if new_type == "nil" && is_nullable_pointer_type(old) == 1
               if old[old.length - 1] != "?"
@@ -5351,9 +5390,14 @@ class Compiler
             end
           end
         end
-        return
       end
       k = k + 1
+    end
+    if @cls_parents[ci] != ""
+      pi = find_class_idx(@cls_parents[ci])
+      if pi >= 0
+        update_ivar_type(pi, iname, new_type)
+      end
     end
   end
 
@@ -6121,6 +6165,20 @@ class Compiler
       end
       return at
     end
+    if is_array_type(old_pt) == 1 && is_array_type(at) == 1
+      if old_pt == "poly_array" || at == "poly_array"
+        @needs_rb_value = 1
+        return "poly_array"
+      end
+      if old_pt == "int_array"
+        return at
+      end
+      if at == "int_array"
+        return old_pt
+      end
+      @needs_rb_value = 1
+      return "poly_array"
+    end
     if at == "int"
       # Numeric compat: int + float is safe in both directions.
       if old_pt == "float"
@@ -6150,6 +6208,88 @@ class Compiler
     # Genuinely incompatible types: fall back to polymorphic value.
     @needs_rb_value = 1
     "poly"
+  end
+
+  def empty_array_new_for_type(t)
+    if t == "str_array"
+      @needs_str_array = 1
+      @needs_gc = 1
+      return "sp_StrArray_new()"
+    end
+    if t == "float_array"
+      @needs_float_array = 1
+      @needs_gc = 1
+      return "sp_FloatArray_new()"
+    end
+    if t == "sym_array" || t == "int_array"
+      @needs_int_array = 1
+      @needs_gc = 1
+      return "sp_IntArray_new()"
+    end
+    if t == "poly_array"
+      @needs_rb_value = 1
+      @needs_gc = 1
+      return "sp_PolyArray_new()"
+    end
+    if is_ptr_array_type(t) == 1
+      @needs_gc = 1
+      return "sp_PtrArray_new()"
+    end
+    ""
+  end
+
+  def compile_expr_for_expected_type(nid, expected_type)
+    expected_base = base_type(expected_type)
+    if expected_type == "poly_array" && nid >= 0 && @nd_type[nid] == "ArrayNode"
+      @needs_rb_value = 1
+      @needs_gc = 1
+      elems = parse_id_list(@nd_elements[nid])
+      tmp = new_temp
+      emit("  sp_PolyArray *" + tmp + " = sp_PolyArray_new();")
+      k = 0
+      while k < elems.length
+        emit("  sp_PolyArray_push(" + tmp + ", " + box_expr_to_poly(elems[k]) + ");")
+        k = k + 1
+      end
+      return tmp
+    end
+    if is_empty_array_literal(nid) == 1
+      val = empty_array_new_for_type(expected_type)
+      if val != ""
+        return val
+      end
+    end
+    val = compile_expr(nid)
+    at = infer_type(nid)
+    if expected_type == "poly" && at != "poly"
+      return box_value_to_poly(at, val)
+    end
+    if expected_type == "string"
+      if at == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_to_s(" + val + ")"
+      end
+      if at == "int"
+        return "sp_int_to_s(" + val + ")"
+      end
+      if at == "float"
+        return "sp_float_to_s(" + val + ")"
+      end
+      if at == "bool"
+        return "(" + val + " ? \"true\" : \"false\")"
+      end
+      if at == "nil"
+        return "(&(\"\\xff\")[1])"
+      end
+      if at == "symbol"
+        return "sp_sym_to_s(" + val + ")"
+      end
+    end
+    if is_obj_type(expected_base) == 1 && at == "poly"
+      cname = expected_base[4, expected_base.length - 4]
+      return "((sp_" + cname + " *)" + val + ".v.p)"
+    end
+    val
   end
 
   def scan_new_calls(nid)
@@ -6187,11 +6327,7 @@ class Compiler
                       while pi < pnames.length
                         if pnames[pi] == kname
                           if pi < ptypes.length
-                            if ptypes[pi] == "int"
-                              if at != "int"
-                                ptypes[pi] = at
-                              end
-                            end
+                            ptypes[pi] = unify_call_types(ptypes[pi], at, @nd_expression[elems[ek]])
                           end
                         end
                         pi = pi + 1
@@ -6229,11 +6365,7 @@ class Compiler
                 else
                   at = infer_type(arg_ids[ak])
                   if ak < ptypes.length
-                    if ptypes[ak] == "int"
-                      if at != "int"
-                        ptypes[ak] = at
-                      end
-                    end
+                    ptypes[ak] = unify_call_types(ptypes[ak], at, arg_ids[ak])
                   end
                 end
               end
@@ -6346,11 +6478,7 @@ class Compiler
                   while kk < arg_ids.length
                     at = infer_type(arg_ids[kk])
                     if kk < ptypes.length
-                      if ptypes[kk] == "int"
-                        if at != "int"
-                          ptypes[kk] = at
-                        end
-                      end
+                      ptypes[kk] = unify_call_types(ptypes[kk], at, arg_ids[kk])
                     end
                     kk = kk + 1
                   end
@@ -6500,11 +6628,8 @@ class Compiler
                         while ij < ivar_names.length
                           if ij < ivar_types.length
                             if ivar_names[ij] == iname
-                              if ivar_types[ij] == "int"
-                                ivar_types[ij] = ptypes[pi]
-                              end
-                              if ivar_types[ij] == "nil"
-                                ivar_types[ij] = ptypes[pi]
+                              if ptypes[pi] != ""
+                                ivar_types[ij] = unify_call_types(ivar_types[ij], ptypes[pi], -1)
                               end
                             end
                           end
@@ -7725,7 +7850,7 @@ class Compiler
         if bid >= 0
           rlnames = "".split(",")
           rltypes = "".split(",")
-          scan_locals_first_type(bid, rlnames, rltypes, pnames)
+          scan_locals(bid, rlnames, rltypes, pnames)
           rlk = 0
           while rlk < rlnames.length
             declare_var(rlnames[rlk], rltypes[rlk])
@@ -7734,7 +7859,7 @@ class Compiler
           # Second pass with locals in scope
           rlnames2 = "".split(",")
           rltypes2 = "".split(",")
-          scan_locals_first_type(bid, rlnames2, rltypes2, pnames)
+          scan_locals(bid, rlnames2, rltypes2, pnames)
           rlk2 = 0
           while rlk2 < rlnames2.length
             if rltypes2[rlk2] != "int"
@@ -9307,11 +9432,7 @@ class Compiler
               while kk < arg_ids.length
                 at = infer_type(arg_ids[kk])
                 if kk < ptypes.length
-                  if ptypes[kk] == "int"
-                    if at != "int"
-                      ptypes[kk] = at
-                    end
-                  end
+                  ptypes[kk] = unify_call_types(ptypes[kk], at, arg_ids[kk])
                 end
                 kk = kk + 1
               end
@@ -9433,6 +9554,8 @@ class Compiler
     prev_sig = inference_signature
     while iter < 4
       infer_all_returns
+      infer_function_body_call_types
+      infer_class_body_call_types
       infer_ivar_types_from_writers
       # Issue #58: after scan_locals has populated @meth_param_empty
       # via the per-call-site forward propagation, promote int_array
@@ -9453,6 +9576,10 @@ class Compiler
     # Must run after iterative loop to override poly from type conflicts
     fix_nil_ivar_self_refs
     # Re-run returns with corrected ivar types
+    infer_all_returns
+    infer_function_body_call_types
+    infer_class_body_call_types
+    infer_ivar_types_from_writers
     infer_all_returns
     # Fix lambda return types based on call-site usage
     fix_lambda_return_types
@@ -12391,6 +12518,15 @@ class Compiler
             if names[ki] == lname
               if types[ki] != at
                 if types[ki] != "poly"
+                  if is_array_type(types[ki]) == 1 && is_array_type(at) == 1
+                    types[ki] = unify_call_types(types[ki], at, @nd_expression[nid])
+                    if types[ki] == "poly_array"
+                      @needs_rb_value = 1
+                      @needs_gc = 1
+                    end
+                    ki = ki + 1
+                    next
+                  end
                   # Genuine polymorphism: both the first write and this
                   # write were explicit literals, and their types differ.
                   # This catches `x = 1; x = "hello"` which the legacy
@@ -12540,6 +12676,18 @@ class Compiler
                   if names[ki] == arr_name
                     if types[ki] == "int_array"
                       types[ki] = "sym_array"
+                    end
+                  end
+                  ki = ki + 1
+                end
+              elsif arg_type == "poly"
+                @needs_rb_value = 1
+                @needs_gc = 1
+                ki = 0
+                while ki < names.length
+                  if names[ki] == arr_name
+                    if types[ki] == "int_array"
+                      types[ki] = "poly_array"
                     end
                   end
                   ki = ki + 1
@@ -13411,7 +13559,33 @@ class Compiler
   # side effects then yields 1.
   def compile_cond_expr(nid)
     expr = compile_expr(nid)
-    if nid >= 0 && is_value_type_obj(infer_type(nid)) == 1
+    t = infer_type(nid)
+    if t == "poly"
+      return "sp_poly_truthy(" + expr + ")"
+    end
+    if t == "nil"
+      return "FALSE"
+    end
+    if is_nullable_type(t) == 1
+      return "(" + expr + " != NULL)"
+    end
+    if nid >= 0 && is_value_type_obj(t) == 1
+      return "((" + expr + "), 1)"
+    end
+    expr
+  end
+
+  def truthy_c_expr(t, expr)
+    if t == "poly"
+      return "sp_poly_truthy(" + expr + ")"
+    end
+    if t == "nil"
+      return "FALSE"
+    end
+    if is_nullable_type(t) == 1
+      return "(" + expr + " != NULL)"
+    end
+    if is_value_type_obj(t) == 1
       return "((" + expr + "), 1)"
     end
     expr
@@ -15319,9 +15493,38 @@ class Compiler
     parts
   end
 
+  def compile_string_concat_unflattened(nid)
+    if nid >= 0 && @nd_type[nid] == "CallNode" && @nd_name[nid] == "+"
+      recv = @nd_receiver[nid]
+      if recv >= 0 && infer_type(recv) == "string"
+        left = compile_string_concat_unflattened(recv)
+        right = "0"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          aargs = get_args(args_id)
+          if aargs.length > 0
+            at = infer_type(aargs[0])
+            if at == "int"
+              right = "sp_int_to_s(" + compile_expr(aargs[0]) + ")"
+            elsif at == "float"
+              right = "sp_float_to_s(" + compile_expr(aargs[0]) + ")"
+            elsif at == "poly"
+              @needs_rb_value = 1
+              right = "sp_poly_to_s(" + compile_expr(aargs[0]) + ")"
+            else
+              right = compile_expr(aargs[0])
+            end
+          end
+        end
+        return "sp_str_concat(" + left + ", " + right + ")"
+      end
+    end
+    compile_expr(nid)
+  end
+
   def collect_concat_parts(nid, parts)
     if parts.length >= 12
-      parts.push(compile_expr(nid))
+      parts.push(compile_string_concat_unflattened(nid))
       return
     end
     if @nd_type[nid] == "CallNode" && @nd_name[nid] == "+"
@@ -15407,6 +15610,10 @@ class Compiler
     # Operators
     if mname == "**" || mname == "pow"
       lt = infer_type(recv)
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_pow(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       if lt == "int"
         return "((mrb_int)pow((double)" + compile_expr(recv) + ", (double)" + compile_arg0(nid) + "))"
       end
@@ -15418,6 +15625,13 @@ class Compiler
         return "sp_str_concat(" + compile_expr(recv) + "->data, " + compile_arg0(nid) + ")"
       end
       if lt == "string"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          arg_ids = get_args(args_id)
+          if arg_ids.length > 0 && infer_type(arg_ids[0]) == "poly"
+            return "sp_str_concat(" + compile_expr(recv) + ", sp_poly_to_s(" + compile_expr(arg_ids[0]) + "))"
+          end
+        end
         # Flatten chained string concat: a + b + c → sp_str_concat3(a,b,c)
         parts = collect_concat_chain(nid)
         if parts.length == 3
@@ -15515,6 +15729,10 @@ class Compiler
     end
     if mname == "/"
       lt = infer_type(recv)
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_div(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       if lt == "float"
         return "(" + compile_expr(recv) + " / " + compile_arg0(nid) + ")"
       end
@@ -15533,6 +15751,10 @@ class Compiler
     end
     if mname == "%"
       lt = infer_type(recv)
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_mod(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       if lt == "string" || lt == "mutable_str"
         args_id = @nd_arguments[nid]
         if args_id >= 0
@@ -15616,6 +15838,10 @@ class Compiler
         end
         return "(strcmp(" + compile_expr(recv) + ", " + compile_arg0(nid) + ") < 0)"
       end
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_lt(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       return "(" + compile_expr(recv) + " < " + compile_arg0(nid) + ")"
     end
     if mname == ">"
@@ -15642,6 +15868,10 @@ class Compiler
         end
         return "(strcmp(" + compile_expr(recv) + ", " + compile_arg0(nid) + ") <= 0)"
       end
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_le(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       return "(" + compile_expr(recv) + " <= " + compile_arg0(nid) + ")"
     end
     if mname == ">="
@@ -15652,6 +15882,10 @@ class Compiler
           return cc
         end
         return "(strcmp(" + compile_expr(recv) + ", " + compile_arg0(nid) + ") >= 0)"
+      end
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_ge(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
       end
       return "(" + compile_expr(recv) + " >= " + compile_arg0(nid) + ")"
     end
@@ -15677,6 +15911,10 @@ class Compiler
       return compile_eq(nid, "!=")
     end
     if mname == "!"
+      lt = infer_type(recv)
+      if lt == "poly"
+        return "(!" + truthy_c_expr(lt, compile_expr(recv)) + ")"
+      end
       return "(!" + compile_expr(recv) + ")"
     end
     if mname == "between?"
@@ -15706,18 +15944,38 @@ class Compiler
       if lt == "string"
         return "sp_str_concat(" + compile_expr(recv) + ", " + compile_arg0(nid) + ")"
       end
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_shl(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       return "(" + compile_expr(recv) + " << " + compile_arg0(nid) + ")"
     end
     if mname == ">>"
+      if infer_type(recv) == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_shr(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       return "(" + compile_expr(recv) + " >> " + compile_arg0(nid) + ")"
     end
     if mname == "&"
+      if infer_type(recv) == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_band(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       return "(" + compile_expr(recv) + " & " + compile_arg0(nid) + ")"
     end
     if mname == "|"
+      if infer_type(recv) == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_bor(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       return "(" + compile_expr(recv) + " | " + compile_arg0(nid) + ")"
     end
     if mname == "^"
+      if infer_type(recv) == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_bxor(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       return "(" + compile_expr(recv) + " ^ " + compile_arg0(nid) + ")"
     end
     if mname == "~"
@@ -15725,6 +15983,10 @@ class Compiler
     end
     if mname == "-@"
       rt = infer_type(recv)
+      if rt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_neg(" + compile_expr(recv) + ")"
+      end
       if rt == "float"
         return "(-" + compile_expr(recv) + ")"
       end
@@ -17334,6 +17596,17 @@ class Compiler
       if mname == "[]"
         return "sp_PolyArray_get(" + rc + ", " + compile_arg0(nid) + ")"
       end
+      if mname == "push"
+        arg_id = -1
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          aargs = get_args(args_id)
+          if aargs.length > 0
+            arg_id = aargs[0]
+          end
+        end
+        return "(sp_PolyArray_push(" + rc + ", " + box_expr_to_poly(arg_id) + "), 0)"
+      end
     end
     ""
   end
@@ -18400,6 +18673,21 @@ class Compiler
     if arg_id >= 0
       rc = compile_expr(arg_id)
     end
+    if lt == "poly" || at == "poly"
+      left = lc
+      right = rc
+      if lt != "poly"
+        left = box_value_to_poly(lt, lc)
+      end
+      if at != "poly"
+        right = box_value_to_poly(at, rc)
+      end
+      if op == "=="
+        return "sp_poly_eq(" + left + ", " + right + ")"
+      else
+        return "(!sp_poly_eq(" + left + ", " + right + "))"
+      end
+    end
     # Symbol equality: distinct from all non-symbol types in Ruby.
     if lt == "symbol"
       if at == "symbol"
@@ -18607,6 +18895,7 @@ class Compiler
     if at == "poly"
       return val
     end
+    at = base_type(at)
     if at == "int"
       return "sp_box_int(" + val + ")"
     end
@@ -18624,6 +18913,29 @@ class Compiler
     end
     if at == "symbol"
       return "sp_box_sym(" + val + ")"
+    end
+    if at == "int_array"
+      return "sp_box_int_array(" + val + ")"
+    end
+    if at == "float_array"
+      return "sp_box_float_array(" + val + ")"
+    end
+    if at == "str_array"
+      return "sp_box_str_array(" + val + ")"
+    end
+    if at == "sym_array"
+      return "sp_box_sym_array(" + val + ")"
+    end
+    if is_ptr_array_type(at) == 1
+      return "sp_box_ptr_array(" + val + ")"
+    end
+    if at == "proc" || at == "lambda"
+      return "sp_box_proc(" + val + ")"
+    end
+    if is_obj_type(at) == 1
+      cname = at[4, at.length - 4]
+      ci = find_class_idx(cname)
+      return "sp_box_obj(" + val + ", " + ci.to_s + ")"
     end
     "sp_box_int(" + val + ")"
   end
@@ -19037,8 +19349,9 @@ class Compiler
         end
         if k < positional_ids.length
           if k < ptypes.length
-            if ptypes[k] == "poly"
-              result = result + box_expr_to_poly(positional_ids[k])
+            if ptypes[k] == "poly" || ptypes[k] == "string" || is_array_type(ptypes[k]) == 1 ||
+               (infer_type(positional_ids[k]) == "poly" && is_obj_type(base_type(ptypes[k])) == 1)
+              result = result + compile_expr_for_expected_type(positional_ids[k], ptypes[k])
               k = k + 1
               next
             end
@@ -19077,12 +19390,24 @@ class Compiler
           if k < defaults.length
             def_id = defaults[k].to_i
             if def_id >= 0
-              result = result + compile_expr(def_id)
+              if k < ptypes.length
+                result = result + compile_expr_for_expected_type(def_id, ptypes[k])
+              else
+                result = result + compile_expr(def_id)
+              end
+            else
+              if k < ptypes.length && ptypes[k] == "poly"
+                result = result + "sp_box_nil()"
+              else
+                result = result + "0"
+              end
+            end
+          else
+            if k < ptypes.length && ptypes[k] == "poly"
+              result = result + "sp_box_nil()"
             else
               result = result + "0"
             end
-          else
-            result = result + "0"
           end
         end
       end
@@ -19116,44 +19441,13 @@ class Compiler
       ak = ak + 1
     end
     if has_kw == 0
-      # Positional args: still need to box any arg whose corresponding
-      # ctor param is poly.
+      # Positional args: compile against the inferred initializer
+      # signature so defaults are filled and poly params are boxed.
       init_ci_p = find_init_class(ci)
       if init_ci_p >= 0
         init_idx_p = cls_find_method_direct(init_ci_p, "initialize")
         if init_idx_p >= 0
-          all_ptypes_p = @cls_meth_ptypes[init_ci_p].split("|")
-          if init_idx_p < all_ptypes_p.length
-            ptypes_p = all_ptypes_p[init_idx_p].split(",")
-            has_poly = 0
-            kpp = 0
-            while kpp < ptypes_p.length
-              if ptypes_p[kpp] == "poly"
-                has_poly = 1
-              end
-              kpp = kpp + 1
-            end
-            if has_poly == 1
-              result_p = ""
-              kp = 0
-              while kp < arg_ids.length
-                if kp > 0
-                  result_p = result_p + ", "
-                end
-                pt_p = "int"
-                if kp < ptypes_p.length
-                  pt_p = ptypes_p[kp]
-                end
-                if pt_p == "poly"
-                  result_p = result_p + box_expr_to_poly(arg_ids[kp])
-                else
-                  result_p = result_p + compile_expr(arg_ids[kp])
-                end
-                kp = kp + 1
-              end
-              return result_p
-            end
-          end
+          return compile_typed_call_args(nid, init_ci_p, init_idx_p, 0)
         end
       end
       return compile_call_args(nid)
@@ -19358,10 +19652,15 @@ class Compiler
         result = result + ", "
       end
       if k < arg_ids.length
-        aexpr = compile_expr(arg_ids[k])
         at = infer_type(arg_ids[k])
         if k < ptypes.length
           pt = ptypes[k]
+          if pt == "poly" || pt == "string" || is_array_type(pt) == 1 || (at == "poly" && is_obj_type(base_type(pt)) == 1)
+            result = result + compile_expr_for_expected_type(arg_ids[k], pt)
+            k = k + 1
+            next
+          end
+          aexpr = compile_expr(arg_ids[k])
           if at == "int"
             if is_obj_type(pt) == 1
               # Cast int to object pointer
@@ -19375,6 +19674,8 @@ class Compiler
               aexpr = "(mrb_int)" + aexpr
             end
           end
+        else
+          aexpr = compile_expr(arg_ids[k])
         end
         result = result + aexpr
       else
@@ -19382,12 +19683,24 @@ class Compiler
         if k < defaults.length
           def_id = defaults[k].to_i
           if def_id >= 0
-            result = result + compile_expr(def_id)
+            if k < ptypes.length
+              result = result + compile_expr_for_expected_type(def_id, ptypes[k])
+            else
+              result = result + compile_expr(def_id)
+            end
+          else
+            if k < ptypes.length && ptypes[k] == "poly"
+              result = result + "sp_box_nil()"
+            else
+              result = result + "0"
+            end
+          end
+        else
+          if k < ptypes.length && ptypes[k] == "poly"
+            result = result + "sp_box_nil()"
           else
             result = result + "0"
           end
-        else
-          result = result + "0"
         end
       end
       k = k + 1
@@ -19692,7 +20005,7 @@ class Compiler
       # early here also preserves the scope's already-promoted type
       # (issue #58, #85) — the fall-through path below would clobber
       # vt with infer_type([])'s "int_array" via set_var_type.
-      if vt == "str_array" || vt == "float_array" || vt == "sym_array" || is_ptr_array_type(vt) == 1
+      if vt == "str_array" || vt == "float_array" || vt == "sym_array" || vt == "poly_array" || is_ptr_array_type(vt) == 1
         expr_id = @nd_expression[nid]
         if expr_id >= 0 && @nd_type[expr_id] == "ArrayNode"
           elems = parse_id_list(@nd_elements[expr_id])
@@ -19710,6 +20023,10 @@ class Compiler
               @needs_int_array = 1
               @needs_gc = 1
               emit("  " + vref + " = sp_IntArray_new();")
+            elsif vt == "poly_array"
+              @needs_rb_value = 1
+              @needs_gc = 1
+              emit("  " + vref + " = sp_PolyArray_new();")
             else
               @needs_gc = 1
               emit("  " + vref + " = sp_PtrArray_new();")
