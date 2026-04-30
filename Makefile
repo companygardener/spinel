@@ -11,10 +11,10 @@
 CC       ?= cc
 CFLAGS   = -O2 -Wno-all
 # Bootstrap-only flags: spinel_codegen runs on the developer's machine
-# only, so we can use -O3 -flto for ~5-10% extra wall-clock without
-# constraining users (whose generated C is built with plain CFLAGS).
-# Override with LTO=0 on toolchains without LTO support.
-LTO     ?= 1
+# only. LTO used to win overall wall-clock, but the current generator is
+# fast enough that the extra compile time costs more than it saves.
+# Override with LTO=1 when optimizing generated-code runtime matters more.
+LTO     ?= 0
 ifeq ($(LTO),1)
   BOOTSTRAP_CFLAGS = -O3 -flto=auto -Wno-all
 else

@@ -144,6 +144,18 @@ class Compiler
     # attr_writer (mutation is rewritten to per-field assignment).
     @cls_is_sra = []
 
+    @cls_ivar_type_cache_index = {}
+    @cls_ivar_type_cache_names = "".split(",")
+    @cls_ivar_type_cache_types = "".split(",")
+    @cls_ivar_type_cache_value = "".split(",")
+    @cls_method_return_cache_index = {}
+    @cls_method_return_cache_names = "".split(",")
+    @cls_method_return_cache_returns = "".split(",")
+    @cls_method_return_cache_value = "".split(",")
+    @cls_find_method_direct_cache_index = {}
+    @cls_find_method_direct_cache_names = "".split(",")
+    @cls_find_method_direct_cache_value = []
+
     # ---- Constants (parallel arrays) ----
     @const_names = "".split(",")
     @const_types = "".split(",")
@@ -404,16 +416,13 @@ class Compiler
     while i < lines.length
       line = lines[i]
       if line.length > 0
-        parts = line.split(" ")
-        if parts.length >= 2
-          if parts.first == "ROOT"
-            @root_id = parts[1].to_i
-          end
-          if parts.first == "N"
-            nid = parts[1].to_i
-            if nid > max_id
-              max_id = nid
-            end
+        first = line.getbyte(0)
+        if first == 82 && line.length >= 5 && line.getbyte(1) == 79
+          @root_id = parse_text_int(line, 5)
+        elsif first == 78
+          nid = parse_text_int(line, 2)
+          if nid > max_id
+            max_id = nid
           end
         end
       end
@@ -436,52 +445,70 @@ class Compiler
     end
   end
 
+  def parse_text_int(line, start)
+    n = 0
+    i = start
+    len = line.length
+    sign = 1
+    if i < len && line.getbyte(i) == 45
+      sign = -1
+      i = i + 1
+    end
+    while i < len
+      c = line.getbyte(i)
+      if c < 48 || c > 57
+        @parse_text_int_end = i
+        return n * sign
+      end
+      n = n * 10 + c - 48
+      i = i + 1
+    end
+    @parse_text_int_end = i
+    n * sign
+  end
+
   def ast_parse_line(line)
-    parts = line.split(" ")
-    if parts.length < 3
+    len = line.length
+    if len < 3
       return
     end
-    tag = parts.first
-    nid = parts[1].to_i
-    if tag == "N"
-      @nd_type[nid] = parts[2]
+    tag = line.getbyte(0)
+    if tag == 82 && line.getbyte(1) != 32
+      return
     end
-    if tag == "S"
-      field = parts[2]
-      val = ""
-      if parts.length >= 4
-        val = unescape_str(parts[3])
-      end
-      set_string_field(nid, field, val)
+    nid = parse_text_int(line, 2)
+    field_start = @parse_text_int_end + 1
+    if field_start >= len
+      return
     end
-    if tag == "I"
-      field = parts[2]
-      ival = 0
-      if parts.length >= 4
-        ival = parts[3].to_i
-      end
-      set_int_field(nid, field, ival)
+    if tag == 78
+      @nd_type[nid] = line[field_start, len - field_start]
+      return
     end
-    if tag == "F"
-      if parts.length >= 4
-        @nd_content[nid] = parts[3]
-      end
+    field_end = field_start
+    while field_end < len && line.getbyte(field_end) != 32
+      field_end = field_end + 1
     end
-    if tag == "R"
-      field = parts[2]
+    field = line[field_start, field_end - field_start]
+    value_start = field_end + 1
+    value = ""
+    if value_start < len
+      value = line[value_start, len - value_start]
+    end
+    if tag == 83
+      set_string_field(nid, field, unescape_str(value))
+    elsif tag == 73
+      set_int_field(nid, field, parse_text_int(value, 0))
+    elsif tag == 70
+      @nd_content[nid] = value
+    elsif tag == 82
       ref_id = -1
-      if parts.length >= 4
-        ref_id = parts[3].to_i
+      if value != ""
+        ref_id = parse_text_int(value, 0)
       end
       set_ref_field(nid, field, ref_id)
-    end
-    if tag == "A"
-      field = parts[2]
-      ids_str = ""
-      if parts.length >= 4
-        ids_str = parts[3]
-      end
-      set_array_field(nid, field, ids_str)
+    elsif tag == 65
+      set_array_field(nid, field, value)
     end
     0
   end
@@ -1257,48 +1284,92 @@ class Compiler
 
   # Get method return type from class
   def cls_method_return(ci, mname)
-    names = @cls_meth_names[ci].split(";")
-    returns = @cls_meth_returns[ci].split(";")
+    names_str = @cls_meth_names[ci]
+    returns_str = @cls_meth_returns[ci]
+    key = ci.to_s + ":" + mname
+    cache_idx = @cls_method_return_cache_index[key]
+    if cache_idx != nil
+      if @cls_method_return_cache_names[cache_idx] == names_str && @cls_method_return_cache_returns[cache_idx] == returns_str
+        return @cls_method_return_cache_value[cache_idx]
+      end
+    end
+    names = names_str.split(";")
+    returns = returns_str.split(";")
+    result = "int"
     j = 0
     while j < names.length
       if names[j] == mname
         if j < returns.length
-          return returns[j]
+          result = returns[j]
+          break
         end
-        return "int"
+        break
       end
       j = j + 1
     end
-    if @cls_parents[ci] != ""
+    if result == "int" && @cls_parents[ci] != ""
       pi = find_class_idx(@cls_parents[ci])
       if pi >= 0
-        return cls_method_return(pi, mname)
+        result = cls_method_return(pi, mname)
       end
     end
-    "int"
+    if cache_idx == nil
+      cache_idx = @cls_method_return_cache_value.length
+      @cls_method_return_cache_index[key] = cache_idx
+      @cls_method_return_cache_names.push(names_str)
+      @cls_method_return_cache_returns.push(returns_str)
+      @cls_method_return_cache_value.push(result)
+    else
+      @cls_method_return_cache_names[cache_idx] = names_str
+      @cls_method_return_cache_returns[cache_idx] = returns_str
+      @cls_method_return_cache_value[cache_idx] = result
+    end
+    result
   end
 
   # Get ivar type from class
   def cls_ivar_type(ci, iname)
-    names = @cls_ivar_names[ci].split(";")
-    types = @cls_ivar_types[ci].split(";")
+    names_str = @cls_ivar_names[ci]
+    types_str = @cls_ivar_types[ci]
+    key = ci.to_s + ":" + iname
+    cache_idx = @cls_ivar_type_cache_index[key]
+    if cache_idx != nil
+      if @cls_ivar_type_cache_names[cache_idx] == names_str && @cls_ivar_type_cache_types[cache_idx] == types_str
+        return @cls_ivar_type_cache_value[cache_idx]
+      end
+    end
+    names = names_str.split(";")
+    types = types_str.split(";")
+    result = "int"
     j = 0
     while j < names.length
       if names[j] == iname
         if j < types.length
-          return types[j]
+          result = types[j]
+          break
         end
-        return "int"
+        break
       end
       j = j + 1
     end
-    if @cls_parents[ci] != ""
+    if result == "int" && @cls_parents[ci] != ""
       pi = find_class_idx(@cls_parents[ci])
       if pi >= 0
-        return cls_ivar_type(pi, iname)
+        result = cls_ivar_type(pi, iname)
       end
     end
-    "int"
+    if cache_idx == nil
+      cache_idx = @cls_ivar_type_cache_value.length
+      @cls_ivar_type_cache_index[key] = cache_idx
+      @cls_ivar_type_cache_names.push(names_str)
+      @cls_ivar_type_cache_types.push(types_str)
+      @cls_ivar_type_cache_value.push(result)
+    else
+      @cls_ivar_type_cache_names[cache_idx] = names_str
+      @cls_ivar_type_cache_types[cache_idx] = types_str
+      @cls_ivar_type_cache_value[cache_idx] = result
+    end
+    result
   end
 
   # ---- Emit helpers ----
@@ -11271,15 +11342,34 @@ class Compiler
   end
 
   def cls_find_method_direct(ci, mname)
-    mnames = @cls_meth_names[ci].split(";")
+    names_str = @cls_meth_names[ci]
+    key = ci.to_s + ":" + mname
+    cache_idx = @cls_find_method_direct_cache_index[key]
+    if cache_idx != nil
+      if @cls_find_method_direct_cache_names[cache_idx] == names_str
+        return @cls_find_method_direct_cache_value[cache_idx]
+      end
+    end
+    mnames = names_str.split(";")
+    result = -1
     j = 0
     while j < mnames.length
       if mnames[j] == mname
-        return j
+        result = j
+        break
       end
       j = j + 1
     end
-    -1
+    if cache_idx == nil
+      cache_idx = @cls_find_method_direct_cache_value.length
+      @cls_find_method_direct_cache_index[key] = cache_idx
+      @cls_find_method_direct_cache_names.push(names_str)
+      @cls_find_method_direct_cache_value.push(result)
+    else
+      @cls_find_method_direct_cache_names[cache_idx] = names_str
+      @cls_find_method_direct_cache_value[cache_idx] = result
+    end
+    result
   end
 
   def method_params_decl(mi)
