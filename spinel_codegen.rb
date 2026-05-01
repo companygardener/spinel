@@ -19445,7 +19445,7 @@ class Compiler
       if init_ci >= 0
         init_idx = cls_find_method_direct(init_ci, "initialize")
         if init_idx >= 0
-          return compile_typed_call_args(nid, init_ci, init_idx, 0)
+          return compile_typed_call_args(nid, init_ci, init_idx, 0, 1)
         end
       end
       return ""
@@ -19467,7 +19467,7 @@ class Compiler
       if init_ci_p >= 0
         init_idx_p = cls_find_method_direct(init_ci_p, "initialize")
         if init_idx_p >= 0
-          return compile_typed_call_args(nid, init_ci_p, init_idx_p, 0)
+          return compile_typed_call_args(nid, init_ci_p, init_idx_p, 0, 1)
         end
       end
       return compile_call_args(nid)
@@ -19614,7 +19614,41 @@ class Compiler
     result
   end
 
-  def compile_typed_call_args(nid, target_ci, target_midx, omit_trailing)
+  def constructor_arg_needs_root(arg_type)
+    bt = base_type(arg_type)
+    if is_obj_type(bt) == 1
+      return 1
+    end
+    if is_array_type(bt) == 1 || is_ptr_array_type(bt) == 1 || is_tuple_type(bt) == 1
+      return 1
+    end
+    if bt == "fiber" || bt == "bigint" || bt == "lambda" || bt == "poly_array"
+      return 1
+    end
+    0
+  end
+
+  def root_constructor_arg_if_needed(expr_id, expr, arg_type, gc_count)
+    if gc_count < 2
+      return expr
+    end
+    if expr_id < 0
+      return expr
+    end
+    if expr_may_gc(expr_id) == 0
+      return expr
+    end
+    if constructor_arg_needs_root(arg_type) == 0
+      return expr
+    end
+    @needs_gc = 1
+    tmp = new_temp
+    emit("  " + c_type(arg_type) + " " + tmp + " = " + expr + ";")
+    emit("  SP_GC_ROOT(" + tmp + ");")
+    tmp
+  end
+
+  def compile_typed_call_args(nid, target_ci, target_midx, omit_trailing, root_constructor_args = 0)
     # Like compile_call_args but casts arguments to match target method param
     # types AND fills in defaults from @cls_meth_defaults for trailing
     # parameters the caller omitted (issue #49). Returns "" only when the
@@ -19664,6 +19698,24 @@ class Compiler
     if total == 0
       return ""
     end
+    gc_count = 0
+    if root_constructor_args == 1
+      gk = 0
+      while gk < total
+        gc_expr_id = -1
+        if gk < arg_ids.length
+          gc_expr_id = arg_ids[gk]
+        else
+          if gk < defaults.length
+            gc_expr_id = defaults[gk].to_i
+          end
+        end
+        if gc_expr_id >= 0 && expr_may_gc(gc_expr_id) == 1
+          gc_count = gc_count + 1
+        end
+        gk = gk + 1
+      end
+    end
     result = ""
     pcname = ""
     k = 0
@@ -19676,7 +19728,11 @@ class Compiler
         if k < ptypes.length
           pt = ptypes[k]
           if pt == "poly" || pt == "string" || is_array_type(pt) == 1 || (at == "poly" && is_obj_type(base_type(pt)) == 1)
-            result = result + compile_expr_for_expected_type(arg_ids[k], pt)
+            aexpr = compile_expr_for_expected_type(arg_ids[k], pt)
+            if root_constructor_args == 1
+              aexpr = root_constructor_arg_if_needed(arg_ids[k], aexpr, pt, gc_count)
+            end
+            result = result + aexpr
             k = k + 1
             next
           end
@@ -19696,6 +19752,10 @@ class Compiler
           end
         else
           aexpr = compile_expr(arg_ids[k])
+          pt = at
+        end
+        if root_constructor_args == 1
+          aexpr = root_constructor_arg_if_needed(arg_ids[k], aexpr, pt, gc_count)
         end
         result = result + aexpr
       else
@@ -19704,9 +19764,17 @@ class Compiler
           def_id = defaults[k].to_i
           if def_id >= 0
             if k < ptypes.length
-              result = result + compile_expr_for_expected_type(def_id, ptypes[k])
+              aexpr = compile_expr_for_expected_type(def_id, ptypes[k])
+              if root_constructor_args == 1
+                aexpr = root_constructor_arg_if_needed(def_id, aexpr, ptypes[k], gc_count)
+              end
+              result = result + aexpr
             else
-              result = result + compile_expr(def_id)
+              aexpr = compile_expr(def_id)
+              if root_constructor_args == 1
+                aexpr = root_constructor_arg_if_needed(def_id, aexpr, infer_type(def_id), gc_count)
+              end
+              result = result + aexpr
             end
           else
             if k < ptypes.length && ptypes[k] == "poly"
