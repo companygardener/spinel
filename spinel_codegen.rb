@@ -6307,6 +6307,20 @@ class Compiler
             arg_ids = get_args(args_id)
             ptypes = @meth_param_types[mi].split(",")
             pnames = @meth_param_names[mi].split(",")
+            rest_param_idx = -1
+            if ptypes.length > 0 && ptypes[ptypes.length - 1] == "int_array"
+              if arg_ids.length != ptypes.length
+                rest_param_idx = ptypes.length - 1
+              else
+                si_rest = 0
+                while si_rest < arg_ids.length
+                  if @nd_type[arg_ids[si_rest]] == "SplatNode"
+                    rest_param_idx = ptypes.length - 1
+                  end
+                  si_rest = si_rest + 1
+                end
+              end
+            end
             # Handle keyword hash args
             ak = 0
             while ak < arg_ids.length
@@ -6365,7 +6379,9 @@ class Compiler
                 else
                   at = infer_type(arg_ids[ak])
                   if ak < ptypes.length
-                    ptypes[ak] = unify_call_types(ptypes[ak], at, arg_ids[ak])
+                    if rest_param_idx < 0 || ak < rest_param_idx
+                      ptypes[ak] = unify_call_types(ptypes[ak], at, arg_ids[ak])
+                    end
                   end
                 end
               end
@@ -18455,6 +18471,10 @@ class Compiler
   end
 
   def poly_dispatch_return_type(mname)
+    if mname == "[]"
+      @needs_rb_value = 1
+      return "poly"
+    end
     common = ""
     ci = 0
     while ci < @cls_names.length
